@@ -1,3 +1,3 @@
 # semi-chest
-## Code for 'Self-supervised Mean Teacher for Semi-supervisedChest X-ray Classification'
+Code for 'Self-supervised Mean Teacher for Semi-supervisedChest X-ray Classification'
 
