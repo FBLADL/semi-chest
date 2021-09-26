@@ -1,4 +1,5 @@
 import argparse
+
 import os
 
 import torch
@@ -264,8 +265,10 @@ class Moco_lincls_single(object):
         net2.eval()
         net1_ema.eval()
         net2_ema.eval()
-        for batch_idx, (inputs_u_s,inputs_u_w,gt_u,item_u) in enumerate(tqdm(loader_u)):
-            inputs_u_s, inputs_u_w = inputs_u_s.cuda(),inputs_u_w.cuda()
+        for batch_idx, (inputs_u_s, inputs_u_w, gt_u, item_u) in enumerate(
+            tqdm(loader_u)
+        ):
+            inputs_u_s, inputs_u_w = inputs_u_s.cuda(), inputs_u_w.cuda()
             optimiz
 
     def pseudo_train(
