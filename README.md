@@ -15,7 +15,7 @@ This repo contains the Pytorch implementation of our paper:
 ## Prepare Dataset
 Download Chest Xray14 from https://nihcc.app.box.com/v/ChestXray-NIHCC/folder/36938765345
 
-## Pre-training
+## Pre-training and Fine-tuning
 
 Prepare the dataset and then run the following command for pretrain: 
 ```shell
