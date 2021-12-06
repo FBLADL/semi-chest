@@ -281,11 +281,11 @@ class DenseNet(nn.Module):
 
         self.classifier = nn.Linear(num_features, num_classes)
 
-        # self.relu = nn.ReLU(inplace=True)
+        self.relu = nn.ReLU(inplace=True)
 
-        # self.classifier_group = nn.Linear(num_features,num_classes)
-        # self.classifier_group = nn.Sequential(nn.Linear(num_features, num_features), nn.ReLU(),
-        #                                       nn.Linear(num_features, num_classes, bias=False))
+        self.classifier_group = nn.Linear(num_features,num_classes)
+        self.classifier_group = nn.Sequential(nn.Linear(num_features, num_features), nn.ReLU(),
+                                              nn.Linear(num_features, num_classes, bias=False))
 
     def forward(self, x):
         features = self.features(x)
@@ -294,8 +294,8 @@ class DenseNet(nn.Module):
 
         out = torch.flatten(out, 1)
         out = self.classifier(out)
-        # out = self.relu(self.classifier(out))
-        # out = self.classifier_group(out)
+        out = self.relu(self.classifier(out))
+        out = self.classifier_group(out)
         return out
 
 

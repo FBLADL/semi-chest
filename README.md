@@ -6,19 +6,24 @@ This repo contains the Pytorch implementation of our paper:
 
 - **Accepted at MICCAI MLMI2021 Workshop.**  
 
+## Requirements
+- Linux
+- Python 3.8
+- Pytorch 1.6
+- Pretrain with 4 * V100 and finetune with 1 * V100
 
-## Training
+## Prepare Dataset
+Download Chest Xray14 from https://nihcc.app.box.com/v/ChestXray-NIHCC/folder/36938765345
 
-Prepare the dataset and then simply run the following command for pretrain: 
+## Pre-training
+
+Prepare the dataset and then run the following command for pretrain: 
 ```shell
-python pretrain.py
-
-
-
+python pretrain.py --data <data_dir> --multiprocessing-distributed --world-size 1 --rank 0 --batch-size 256 --lr 0.03 --arch densenet121 --mlp --cos --task chestxray14 --dist-url tcp://localhost:10001 --jcl
 ```
 For Fine-tuning, run
 ```shell
-python finetune.py
+python finetune.py --pretrained <pretrain model dir>
 ```
 
 

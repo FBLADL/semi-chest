@@ -10,7 +10,6 @@ from sklearn.preprocessing import MultiLabelBinarizer
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import transforms
 
-from utils.gcloud import download_chestxray_unzip
 
 Labels = {'No Finding': 14, 'Atelectasis': 0, 'Cardiomegaly': 1, 'Effusion': 2, 'Infiltration': 3, 'Mass': 4,
           'Nodule': 5, 'Pneumonia': 6, 'Pneumothorax': 7,
@@ -132,8 +131,6 @@ class ChestDataloader():
         self.k_crop = k_crop
         mean = [0.485, 0.456, 0.406]
         std = [0.229, 0.224, 0.225]
-        if gc_cloud:
-            download_chestxray_unzip(root_dir)
 
         self.root_dir = root_dir
 

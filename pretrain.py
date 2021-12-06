@@ -17,9 +17,6 @@ import torchvision.models as models
 from utils.model_se import densenet121
 from utils.builders import builder_fa, builder
 from utils.dataloaders.dataloader import ChestDataloader
-from utils.dataloaders.dataloader_xpert import ChexpertLoader
-from utils.gcloud import upload_checkpoint
-from utils.gcloud import download_chexpert_unzip
 
 model_names = sorted(
     name
@@ -144,10 +141,6 @@ parser.add_argument("--jcl", action="store_true")
 parser.add_argument("--ratio-weight", default=2.0, type=float)
 parser.add_argument("--jcl-weight", default=0.5, type=float)
 
-# dense loss
-parser.add_argument("--densecl", action="store_true")
-parser.add_argument("--dense-weight", default=0.3, type=float)
-
 # Arch config
 parser.add_argument(
     "--latent-dim", default=128, type=int, help="feature dimension (default: 128)"
@@ -188,7 +181,6 @@ parser.add_argument("--user", default="fb", type=str)
 def main():
     args = parser.parse_args()
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
-    download_chexpert_unzip(args.data)
     ngpus_per_node = torch.cuda.device_count()
     if args.multiprocessing_distributed:
         # Since we have ngpus_per_node processes per node, the total world_size
@@ -328,8 +320,6 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     top5 = AverageMeter("Acc@5", ":6.2f")
     jcl_losses = AverageMeter("jcl_Loss", ":.4e")
     cls_losses = AverageMeter("CLS_Loss", ":.4e")
-    dense_losses = AverageMeter("dense_Loss", ":.4e")
-    global_losses = AverageMeter("global_Loss", ":.4e")
     print_infos = [batch_time, data_time, losses, jcl_losses, cls_losses, top1, top5]
     progress = ProgressMeter(
         len(train_loader), print_infos, prefix="Epoch: [{}]".format(epoch)
@@ -340,7 +330,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
     scaler = torch.cuda.amp.GradScaler(enabled=True)
     end = time.time()
-    for i, (images, _, _) in enumerate(train_loader):
+    for i, (images, _,) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
         if args.gpu is not None:
@@ -369,9 +359,6 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         losses.update(final_loss.item(), images[0].size(0))
         #
-        # jcl_losses.update(jcl_loss.item(), output[0].shape[0]) if args.jcl else None
-        # dense_losses.update(loss_dense.item(), images[0].shape[0]) if args.densecl else None
-        # global_losses.update(loss_global.item(), images[0].shape[0])
 
         top1.update(acc1[0], images[0].size(0))
         top5.update(acc5[0], images[0].size(0))
@@ -402,6 +389,7 @@ def create_encoder(arch, args):
         )
     else:
         model.classifier = nn.Linear(in_features, args.latent_dim)
+    print(model)
     return model
 
 

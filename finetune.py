@@ -1,23 +1,16 @@
 import argparse
-
 import os
 
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
 from tqdm import tqdm
+from typing_extensions import runtime
+
 from utils.dataloaders.dataloader_semi import ChestDataloader
+from utils.model_se import models
 
-# from utils.dataloaders.dataloader_xpert import ChexpertLoader
-# from utils.dataloader import ChestDataloader
-import utils.model_se as models
-
-# from utils.model_se import FTHead
-# from utils.gcloud import download_checkpoint, upload_checkpoint
-import numpy as np
-import math
-
-parser = argparse.ArgumentParser(description="PyTorch Clothing1M Training")
+parser = argparse.ArgumentParser(description="PyTorch CX14 Training")
 
 model_names = sorted(
     name
@@ -25,8 +18,7 @@ model_names = sorted(
     if name.islower() and not name.startswith("__") and callable(models.__dict__[name])
 )
 # general setting
-parser = argparse.ArgumentParser(description="S2MTS2 Finetuning")
-parser.add_argument("--data", metavar="DIR", help="path to dataset")
+parser.add_argument("--batch-size", default=16, type=int, help="train batchsize")
 parser.add_argument(
     "-a",
     "--arch",
@@ -35,9 +27,17 @@ parser.add_argument(
     choices=model_names,
     help="model architecture: " + " | ".join(model_names) + " (default: densenet121)",
 )
+
 parser.add_argument(
-    "--epochs", default=30, type=int, metavar="N", help="number of total epochs to/run"
+    "--lr", "--learning_rate", default=0.05, type=float, help="initial learning rate"
 )
+parser.add_argument("--num-epochs", default=100, type=int)
+parser.add_argument("--num-workers", default=8, type=int)
+parser.add_argument(
+    "--data-path", default="chestxray/", type=str, help="path to dataset"
+)
+parser.add_argument("--num-class", default=15, type=int)
+parser.add_argument("--save", default="multi_label", type=str)
 parser.add_argument(
     "--start-epoch",
     default=0,
@@ -45,78 +45,25 @@ parser.add_argument(
     metavar="N",
     help="manual epoch number (useful on restarts)",
 )
-parser.add_argument(
-    "-b",
-    "--batch-size",
-    default=16,
-    type=int,
-    metavar="N",
-    help="mini-batch size (default: 256), this is the total "
-    "batch size of all GPUs on the current node when "
-    "using Data Parallel or Distributed Data Parallel",
-)
-parser.add_argument(
-    "--lr",
-    "--learning-rate",
-    default=0.05,
-    type=float,
-    metavar="LR",
-    help="initial learning rate",
-    dest="lr",
-)
-parser.add_argument("--num-workers", default=8, type=int)
-parser.add_argument(
-    "--schedule",
-    default=[15, 25],
-    nargs="*",
-    type=int,
-    help="learning rate schedule (when to drop lr by 10x)",
-)
-parser.add_argument(
-    "-p",
-    "--print-freq",
-    default=10,
-    type=int,
-    metavar="N",
-    help="print frequency (default: 10)",
-)
-parser.add_argument("--gpu", default=1, type=int)
-parser.add_argument("--num-class", default=15, type=int)
-# experiment
-parser.add_argument(
-    "--task", choices=["chestxray14", "chexpert", "ISIC"], nargs="*", type=str
-)
-
-# MT
-parser.add_argument("--mt", action="store_true")
-parser.add_argument("--cons_weight", default=1.0, type=float)
-parser.add_argument("--cons_rampup", default=10, type=int)
-parser.add_argument("--ema_weight", default=0.99, type=float)
-
-# ELR
-parser.add_argument("--elr", action="store_true")
-parser.add_argument("--elr_weight", default=3, type=int)
-parser.add_argument("--beta", default=0.9, type=float)
-# semi
-parser.add_argument("--label_ratio", default=2, type=int)
-parser.add_argument("--runtime", default=1, type=int)
-
+parser.add_argument("--desc", default="baseline", help="description of experiment")
+parser.add_argument("--mlp", action="store_true", help="replace linear with MLP")
+parser.add_argument("--gpu", default=0, type=int)
+# warmup
+parser.add_argument("--warmup-epochs", default=10, type=int)
 parser.add_argument("--pretrained", default="", type=str)
-# options for utils v2
-parser.add_argument("--mlp", action="store_true", help="use mlp head")
-# docker and gcloud
-parser.add_argument(
-    "--gcloud", action="store_true", help="use gc cloud for storing file"
-)
-parser.add_argument("--dst_bucket_project", default="aiml-carneiro-research", type=str)
-parser.add_argument(
-    "--dst_bucket_name", default="aiml-carneiro-research-data", type=str
-)
-parser.add_argument("--download-name", default="s2mts2_densecl", type=str)
-parser.add_argument("--upload-name", default="s2mts2", type=str)
-parser.add_argument("--resize", default=256, type=int)
-parser.add_argument("--user", default="fb", type=str)
 
+# DGX
+parser.add_argument("--v2mlp", action="store_true", help="use simclr v2 mlp")
+parser.add_argument("--resize", default=512, type=int)
+parser.add_argument("--imagenet", action="store_true")
+parser.add_argument("--freeze-net", action="store_true", help="freeze feature layers")
+parser.add_argument(
+    "--fine-tune-first",
+    action="store_true",
+    help="fine tune from first mlp head or from middle mlp",
+)
+parser.add_argument("--ratio", default=2, type=int)
+parser.add_argument("--runtime", default=1, type=int)
 args = parser.parse_args()
 
 Labels = {
@@ -138,6 +85,28 @@ Labels = {
 }
 
 
+class WeightEMA(object):
+    def __init__(self, model, ema_model, alpha=0.999):
+        self.model = model
+        self.ema_model = ema_model
+        self.alpha = alpha
+        self.params = list(model.state_dict().values())
+        self.ema_params = list(ema_model.state_dict().values())
+        # self.wd = 0.02 * args.lr
+
+        for param, ema_param in zip(self.params, self.ema_params):
+            param.data.copy_(ema_param.data)
+
+    def step(self):
+        one_minus_alpha = 1.0 - self.alpha
+        for param, ema_param in zip(self.params, self.ema_params):
+            if param.type() == "torch.cuda.LongTensor":
+                ema_param = param
+            else:
+                ema_param.mul_(self.alpha)
+                ema_param.add_(param * one_minus_alpha)
+
+
 class Moco_lincls_single(object):
     def __init__(self) -> None:
         super().__init__()
@@ -147,256 +116,119 @@ class Moco_lincls_single(object):
         cudnn.benchmark = True
 
         backbone = models.__dict__[args.arch]
-        self.net1, self.net2 = self.create_model(backbone, args.num_class, args.mlp)
-        self.net1_ema, self.net2_ema = self.create_model(
-            backbone, args.num_class, args.mlp, ema=True, imagenet=False
-        )
-        self.optimizer1, self.optimizer2 = self.create_optimizer()
+        self.net1 = self.create_model(backbone, args.num_class, args.mlp)
+
+        self.optimizer1 = self.create_optimizer()
 
         self.scaler = torch.cuda.amp.GradScaler(enabled=True)
         self.loader = ChestDataloader(
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             img_resize=args.resize,
-            root_dir=args.data,
+            root_dir=args.data_path,
             gc_cloud=args.gcloud,
+            imagenet=args.imagenet,
         )
 
-        self.lr_scheulder1 = self.create_scheduler("step", self.optimizer1)
-        self.lr_scheduler2 = self.create_scheduler("step", self.optimizer2)
-        self.optimizer1_ema = WeightEMA(self.net1, self.net1_ema)
-        self.optimizer2_ema = WeightEMA(self.net2, self.net2_ema)
+        self.lr_scheulder1 = self.create_scheduler("step")
 
     def deploy(self):
-        test_loader, _ = self.loader.run(
-            "test", ratio=args.label_ratio, runtime=args.runtime
-        )
+        test_loader, _ = self.loader.run("test")
         labeled_loader, _ = self.loader.run(
-            "labeled", ratio=args.label_ratio, runtime=args.runtime
+            "sup_train", ratio=args.ratio, runtime=args.runtime
         )
-        if args.label_ratio != 100:
+        if args.ratio != 100:
             unlabeled_loader, _ = self.loader.run(
-                "unlabeled", ratio=args.label_ratio, runtime=args.runtime
+                "unlabeled", ratio=args.ratio, runtime=args.runtime
             )
         else:
             unlabeled_loader = None
-        self.warmup_criterion1 = ELR_Plus(len(labeled_loader.dataset), beta=args.beta)
-        self.warmup_criterion2 = ELR_Plus(len(labeled_loader.dataset), beta=args.beta)
-        # warmup_criterion = nn.MultiLabelSoftMarginLoss().cuda()
+        warmup_criterion = nn.MultiLabelSoftMarginLoss().cuda()
 
+        warmup = 0
         if args.pretrained:
-            prefix = os.path.join(args.user, "pretrain/s2mts2", args.download_name)
-            download_checkpoint(
-                args.pretrained, prefix, args.dst_bucket_project, args.dst_bucket_name
-            )
+            prefix = os.path.join(args.user, args.download_name, "checkpoints")
             print("==> loading checkpoint {}".format(args.pretrained))
             checkpoint1 = torch.load(args.pretrained)
             state_dict = checkpoint1["state_dict"]
             for k in list(state_dict.keys()):
                 # use v2mlp with three layer mlp, remove from middle
                 # use v1mlp with two layer mlp, remove all
-                if k.startswith("module.encoder_q"):
-                    state_dict[k[len("module_encoder_q.") :]] = state_dict[k]
-                elif k.startswith("module.encoder_q.mlp_kept") or k.startswith(
-                    "module.encoder_q.mlp2_kept"
+                if k.startswith("module.encoder_q") and not k.startswith(
+                    "module.encoder_q.{}".format(
+                        "classifier_group" if args.v2mlp else "classifier"
+                    )
                 ):
-                    state_dict[k[len("module_encoder_q.") :]] = state_dict[k]
+                    state_dict[k[len("module.encoder_q.") :]] = state_dict[k]
                 del state_dict[k]
             args.start_epoch = 0
             self.net1.load_state_dict(state_dict, strict=False)
-            self.net2.load_state_dict(state_dict, strict=False)
             print("==> loaded checkpoint {}".format(args.pretrained))
 
-            # self.optimizer1_ema = WeightEMA(self.net1, self.net1_ema)
-            # self.optimizer2_ema = WeightEMA(self.net2, self.net2_ema)
+        if args.freeze_net:
+            for name, param in self.net1.named_parameters():
+                if name not in ["classifier_group.weight", "classifier_group.bias"]:
+                    param.requires_grad = False
+            self.net1.classifier_group.weight.data.normal_(mean=0.0, std=0.01)
+            self.net1.classifier_group.bias.data.zero_()
 
-        for warmup in range(args.start_epoch, args.epochs):
-            self.adjust_learning_rate(warmup)
-            state_dict1, early_targets1 = self.pseudo_train(
-                self.warmup_criterion1,
-                warmup,
-                self.net1,
-                self.net1_ema,
-                self.optimizer1,
-                labeled_loader,
-                unlabeled_loader,
-                net_ema2=self.net2_ema,
-                optimizer_ema=self.optimizer1_ema,
+        for warmup in range(args.start_epoch, args.warmup_epochs):
+            state_dict = self.warmup_train(
+                warmup_criterion, warmup, self.net1, self.optimizer1, labeled_loader, 1
             )
-            # self.lr_scheulder1.step(
-            state_dict2, early_targets2 = self.pseudo_train(
-                self.warmup_criterion2,
-                warmup,
-                self.net2,
-                self.net2_ema,
-                self.optimizer2,
-                labeled_loader,
-                unlabeled_loader,
-                net_ema2=self.net1_ema,
-                optimizer_ema=self.optimizer2_ema,
-            )
-            state_dict = {
-                "epoch": warmup,
-                "net1": state_dict1,
-                "net2": state_dict2,
-                "et1": early_targets1,
-                "et2": early_targets2,
-            }
+            self.lr_scheulder1.step()
             mean_auc = self.test(warmup, test_loader)
 
-            checkpoint_name = "ck_epoch{}_{}".format(warmup, mean_auc * 100)
+            checkpoint_name = "net{}_epoch{}_{}".format(1, warmup, mean_auc * 100)
             torch.save(state_dict, checkpoint_name)
 
-            # self.lr_scheduler2.step()
-
-            self.save_checkpoint(filename=checkpoint_name, upload=False)
+            self.save_checkpoint(filename=checkpoint_name)
         # upload each label auc
         self.save_checkpoint(filename="result.csv")
 
-    def save_checkpoint(self, filename="checkpoint", upload=False):
-        prefix = os.path.join(args.user, "finetune", args.upload_name)
-        if upload:
-            upload_checkpoint(
-                args.dst_bucket_project, args.dst_bucket_name, prefix, filename
-            )
+    def save_checkpoint(self, filename="checkpoint"):
+        prefix = os.path.join(args.user, args.upload_name, "checkpoints")
+        upload_checkpoint(
+            args.dst_bucket_project, args.dst_bucket_name, prefix, filename
+        )
 
-    def pseudo_label(self, epoch, net1, net2, net1_ema, net2_ema, optimizer1, loader_u):
-        net1.eval()
-        net2.eval()
-        net1_ema.eval()
-        net2_ema.eval()
-        for batch_idx, (inputs_u_s, inputs_u_w, gt_u, item_u) in enumerate(
-            tqdm(loader_u)
-        ):
-            inputs_u_s, inputs_u_w = inputs_u_s.cuda(), inputs_u_w.cuda()
-            optimiz
-
-    def pseudo_train(
-        self,
-        criterion,
-        epoch,
-        net,
-        net_ema,
-        optimizer,
-        loader_x,
-        loader_u,
-        net_ema2=None,
-        optimizer_ema=None,
-    ):
+    def warmup_train(self, criterion, epoch, net, optimizer, loader, train_flag):
+        # net.eval()
         net.train()
-        loader_tqdm = tqdm(loader_x)
-        loader = enumerate(loader_tqdm)
-        net_ema.train()
-        net_ema2.train()
-        for batch_idx, (inputs_x_s, inputs_x_w, gt_l, item_l) in loader:
-            inputs_x, labels = inputs_x_w.cuda(), gt_l.squeeze().cuda()
-            optimizer.zero_grad()
 
-            lamb = np.random.beta(1.0, 1.0)
-            lamb = max(lamb, 1 - lamb)
-            mix_index = torch.randperm(inputs_x.shape[0]).cuda()
+        loader = enumerate(tqdm(loader, desc="Warmup {}".format(epoch)))
+        for batch_idx, (inputs, labels) in loader:
+            inputs, labels = inputs.cuda(), labels.squeeze().cuda()
+
             with torch.cuda.amp.autocast(enabled=True):
-                outputs_x = net(inputs_x)
-                outputs_x_ema = net_ema2(inputs_x).detach()
-
-                criterion.update_hist(
-                    outputs_x_ema,
-                    item_l.numpy().tolist(),
-                    mix_index=mix_index,
-                    lamb=lamb,
-                )
-                loss, elr_reg = criterion(item_l, outputs_x.float(), labels.float())
-                total_loss = loss + args.elr_weight * elr_reg
-
-            early_targets = criterion.get_target()
-
-            self.scaler.scale(total_loss).backward()
-            loader_tqdm.set_description(
-                f"Fine tune: loss: {loss.item()}, elr: {elr_reg}"
-            )
+                outputs = net(inputs)
+                loss = criterion(outputs.float(), labels.float())
+            self.scaler.scale(loss).backward()
             self.scaler.step(optimizer)
-            optimizer_ema.step()
             self.scaler.update()
-        # state = {'epoch': epoch, 'state_dict': net_ema.state_dict()}
-        return net_ema.state_dict(), early_targets
-
-    def train(
-        self,
-        criterion,
-        epoch,
-        net,
-        net_ema,
-        optimizer,
-        loader_x,
-        loader_u,
-        net_ema2=None,
-        optimizer_ema=None,
-    ):
-        net.train()
-        loader_tqdm = tqdm(loader_x)
-        loader = enumerate(loader_tqdm)
-        net_ema.train()
-        net_ema2.train()
-        # unlabeled_iter = iter(loader_u)
-        for batch_idx, (inputs_x, _, labels, item) in loader:
-            # try:
-            #     inputs_u = unlabeled_iter.next()
-            # except:
-            #     unlabeled_iter = iter(loader_u)
-            #     inputs_u = unlabeled_iter.next()
-            inputs_x, labels = inputs_x.cuda(), labels.squeeze().cuda()
-            # inputs_u = inputs_u.cuda()
             optimizer.zero_grad()
-
-            lamb = np.random.beta(1.0, 1.0)
-            lamb = max(lamb, 1 - lamb)
-            mix_index = torch.randperm(inputs_x.shape[0]).cuda()
-            with torch.cuda.amp.autocast(enabled=True):
-                outputs_x = net(inputs_x)
-                outputs_x_ema = net_ema2(inputs_x).detach()
-
-                # outputs_u = net(inputs_u)
-                # outputs_u_ema = net_ema(inputs_u).detach()
-
-                # outputs_u_pseudo = net_ema2(inputs_u).detach()
-                # elr_targets = criterion.get_target(item)
-
-                # mse = torch.mean((torch.sigmoid(outputs_u) -
-                #                   torch.sigmoid(outputs_u_ema)) ** 2)
-                # weight = 1.0 if (
-                #                         epoch / args.epochs) > 1.0 else (epoch / args.epochs)
-
-                criterion.update_hist(
-                    outputs_x_ema, item.numpy().tolist(), mix_index=mix_index, lamb=lamb
-                )
-                loss, elr_reg = criterion(item, outputs_x.float(), labels.float())
-                total_loss = loss + args.elr_weight * elr_reg
-
-            early_targets = criterion.get_target()
-
-            self.scaler.scale(total_loss).backward()
-            loader_tqdm.set_description(
-                f"Fine tune: loss: {loss.item()}, elr: {elr_reg}"
-            )
-            self.scaler.step(optimizer)
-            optimizer_ema.step()
-            self.scaler.update()
-        # state = {'epoch': epoch, 'state_dict': net_ema.state_dict()}
-        return net_ema.state_dict(), early_targets
+            # print('loss {}'.format(loss.item()))
+        state = {
+            "epoch": epoch,
+            "state_dict": net.state_dict(),
+            "optimizer": optimizer.state_dict(),
+        }
+        return state
+        # torch.save(state, os.path.join(
+        #     self.net_path, 'net{}_epoch_{}.pth.tar'.format(train_flag, epoch)))
 
     def test(self, epoch, loader):
-        self.net1_ema.eval()
-        self.net2_ema.eval()
+        self.net1.eval()
         targs, preds = torch.LongTensor([]), torch.tensor([])
         with torch.no_grad():
-            for batch_idx, (inputs, targets, item) in enumerate(
+            for batch_idx, (inputs, targets) in enumerate(
                 tqdm(loader, desc="Test{}".format(epoch))
             ):
                 inputs, targets = inputs.cuda(), targets.cuda()
                 with torch.cuda.amp.autocast():
-                    outputs1 = self.net1_ema(inputs)
-                    outputs2 = self.net2_ema(inputs)
-                outputs = (outputs1 + outputs2) / 2
+                    outputs1 = self.net1(inputs)
+                # outputs = (outputs1 + outputs2) / 2
+                outputs = outputs1
 
                 preds = torch.cat((preds, torch.sigmoid(outputs).detach().cpu()))
                 targs = torch.cat((targs, targets.detach().cpu().long()))
@@ -430,63 +262,43 @@ class Moco_lincls_single(object):
         print("| Mean AUC {}".format(mean_auc.item()))
         return mean_auc
 
-    def create_scheduler(self, name, optimizer):
+    def create_scheduler(self, name):
         if name == "cosine":
             return torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=10, eta_min=0.001
+                self.optimizer1, T_max=10, eta_min=0.001
             )
         elif name == "step":
-            return torch.optim.lr_scheduler.MultiStepLR(optimizer, [20, 30], gamma=0.1)
+            return torch.optim.lr_scheduler.MultiStepLR(
+                self.optimizer1, [15, 25], gamma=0.1
+            )
 
     def create_log(self):
-        # self.experiment_name = args.desc
+        self.experiment_name = args.desc
+        # self.img_path = os.path.join(args.save, self.experiment_name, 'img')
+        # self.net_path = os.path.join(args.save, self.experiment_name, 'net')
         self.log_path = "result.csv"
+        # self.log_path = os.path.join(
+        #     args.save, self.experiment_name, 'results.csv')
 
         with open(self.log_path, "a") as f:
             f.write(
                 "epoch,Atelectasis,Cardiomegaly,Effusion,Infiltration,Mass,Nodule,Pneumonia,Pneumothorax,Consolidation,Edema,Emphysema,Fibrosis,Pleural_Thickening,Hernia,Mean\n"
             )
 
-    def create_model(self, arch, num_class, mlp, ema=False, imagenet=True):
-        model1 = arch(pretrained=imagenet)
-        model2 = arch(pretrained=imagenet)
-        in_features = 1024
-        model1.classifier = nn.Linear(in_features, num_class)
-        model2.classifier = nn.Linear(in_features, num_class)
-        # head1 = FTHead(in_features, num_class)
-        # head2 = FTHead(in_features, num_class)
-        # model1 = nn.Sequential(model1, head1)
-        # model2 = nn.Sequential(model2, head2)
-        model1, model2 = model1.cuda(), model2.cuda()
-        # print(model1)
-        if ema:
-            for param in model1.parameters():
-                param.detach_()
-            for param in model2.parameters():
-                param.detach_()
-        return model1, model2
+    def create_model(self, arch, num_class, mlp):
+        model1 = arch(pretrained=True, progress=True)
+        in_features = model1.classifier.in_features
+        model1.classifier = nn.Linear(in_features, in_features)
+        model1.classifier_group = nn.Sequential(
+            nn.Linear(in_features, in_features),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Linear(in_features, num_class, bias=False),
+        )
+        return model1.cuda()
 
     def create_optimizer(self):
-        return torch.optim.Adam(
-            list(filter(lambda p: p.requires_grad, self.net1.parameters())),
-            lr=args.lr,
-            betas=(0.9, 0.99),
-            eps=0.1,
-        ), torch.optim.Adam(
-            list(filter(lambda p: p.requires_grad, self.net2.parameters())),
-            lr=args.lr,
-            betas=(0.9, 0.99),
-            eps=0.1,
-        )
-
-    def adjust_learning_rate(self, epoch):
-        """Decay the learning rate based on schedule"""
-        lr = args.lr
-        lr *= 0.5 * (1.0 + math.cos(math.pi * epoch / args.epochs))
-        for param_group in self.optimizer1.param_groups:
-            param_group["lr"] = lr
-        for param_group in self.optimizer2.param_groups:
-            param_group["lr"] = lr
+        parameters = list(filter(lambda p: p.requires_grad, self.net1.parameters()))
+        return torch.optim.Adam(parameters, lr=args.lr, betas=(0.9, 0.99), eps=0.1)
 
     def auc_roc_score(self, input, targ):
         "Computes the area under the receiver operator characteristic (ROC) curve using the trapezoid method. Restricted binary classification tasks."
@@ -515,68 +327,6 @@ class Moco_lincls_single(object):
             tps = torch.cat((zer, tps))
         fpr, tpr = fps.float() / fps[-1], tps.float() / tps[-1]
         return fpr, tpr
-
-
-class WeightEMA(object):
-    def __init__(self, model, ema_model, alpha=0.999):
-        self.model = model
-        self.ema_model = ema_model
-        self.alpha = alpha
-        self.params = list(model.state_dict().values())
-        self.ema_params = list(ema_model.state_dict().values())
-        # self.wd = 0.02 * args.lr
-
-        for param, ema_param in zip(self.params, self.ema_params):
-            param.data.copy_(ema_param.data)
-
-    def step(self):
-        one_minus_alpha = 1.0 - self.alpha
-        for param, ema_param in zip(self.params, self.ema_params):
-            # fix the error 'RuntimeError: result type Float can't be cast to the desired output type Long'
-            # print(param.type())
-            if param.type() == "torch.cuda.LongTensor":
-                ema_param = param
-            else:
-                ema_param.mul_(self.alpha)
-                ema_param.add_(param * one_minus_alpha)
-            # customized weight decay
-            # param.mul_(1 - self.wd)
-
-
-class ELR_Plus(nn.Module):
-    def __init__(self, num_examp, num_classes=15, beta=0.7):
-        super().__init__()
-        self.pred_hist = torch.zeros(num_examp, num_classes).cuda()
-        self.beta = beta
-        self.base_loss = nn.MultiLabelSoftMarginLoss().cuda()
-
-    def forward(self, index, output, label):
-        y_pred = torch.sigmoid(output)
-        y_pred = torch.clamp(y_pred, 1e-4, 1.0 - 1e-4)
-
-        # loss = torch.mean(-torch.sum(label *
-        #                              F.log_softmax(output, dim=1), dim=-1))
-        loss = self.base_loss(output, label)
-        reg = ((1 - (self.q * y_pred)).log()).mean()
-        return loss, reg
-
-    def update_hist(self, out, index, mix_index, lamb):
-        y_pred_ = torch.sigmoid(out).detach()
-        self.pred_hist[index] = (
-            self.beta * self.pred_hist[index] + (1 - self.beta) * y_pred_
-        )
-        self.q = (
-            lamb * self.pred_hist[index] + (1 - lamb) * self.pred_hist[index][mix_index]
-        )
-
-    def get_target(self, index=None):
-        if index:
-            return self.pred_hist[index]
-        else:
-            return self.pred_hist
-
-    def set_target(self, target):
-        self.pred_hist = target
 
 
 if __name__ == "__main__":
