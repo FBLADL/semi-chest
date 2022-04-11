@@ -1,6 +1,6 @@
 # S2MTS2
 This repo contains the Pytorch implementation of our paper: 
-> [**Self-supervised Mean Teacher for Semi-supervised Chest X-ray Classification**](https://arxiv.org/pdf/2103.03423.pdf)
+> [**Self-supervised Mean Teacher for Semi-supervised Chest X-ray Classification**](https://arxiv.org/abs/2103.03629.pdf)
 >
 > Fengbei Liu*, [Yu Tian*](https://yutianyt.com/), Filipe R. Cordeiro, [Vasileios Belagiannis](https://www.uni-ulm.de/in/mrm/institut/mitarbeiter/gruppenleiter/vb/), [Ian Reid](https://cs.adelaide.edu.au/~ianr/), [Gustavo Carneiro](https://cs.adelaide.edu.au/~carneiro/).
 
